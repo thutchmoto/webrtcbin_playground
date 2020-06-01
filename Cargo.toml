@@ -1,0 +1,37 @@
+# Copyright (C) 2019-2020 Motorola Solutions, Inc. All rights reserved.
+
+[package]
+name = "webrtcbin_playground"
+version = "0.1.0"
+authors = ["Trey Hutcheson <trey.hutcheson@motorolasolutions.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix-web = "2.0"
+actix-rt = "1.0"
+actix-files = "0.2.2"
+log = "0.4.8"
+env_logger = "0.7.1"
+
+[dependencies.lazy_static]
+version = "1.4.0"
+
+[dependencies.gstreamer]
+version = "0.15.5"
+
+[dependencies.gstreamer-webrtc]
+version = "0.15.5"
+
+[dependencies.gstreamer-sdp]
+version = "0.15.5"
+
+[dependencies.glib]
+version = "0.9.3"
+
+[dependencies.webrtc-sdp]
+version = "0.3.6"
+
+[dependencies.anyhow]
+version = "1.0.31"
