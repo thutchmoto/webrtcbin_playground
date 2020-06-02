@@ -1,0 +1,158 @@
+<!-- Copyright (C) 2019-2020 Motorola Solutions, Inc. All rights reserved.-->
+<!DOCTYPE html>
+<html>
+<head>
+    <script>
+
+function onLocalIceCandidate(peer, event) {
+    if (event.candidate) {
+        const json = JSON.stringify(event.candidate)
+        console.log(`Got local ice candidate: ${json}`)
+        let mline = event.candidate["sdpMLineIndex"]
+        let raw = event.candidate["candidate"]
+
+        postIceCandidate(peer, mline, raw)
+    }
+    else {
+        console.log('No more ice candidates.')
+        let localDescription = peer.localDescription
+        console.log(`New description: ${localDescription.sdp}`)
+    }
+}
+
+function onTrackFound(peer, videoElement, event) {
+    console.log(`New track found.`)
+    event.streams.forEach(stream => {
+        videoElement.srcObject = stream
+    })
+}
+
+function addVideoTracks(videoSource, peer) {
+    console.log('Adding video tracks to peer connection.')
+    videoSource
+        .srcObject
+        .getTracks()
+        .forEach(track => peer.addTrack(track, videoSource.srcObject))
+}
+
+async function setupPeer() {
+    const receiverLocalVideo = document.getElementById('local-video')
+    const receiverRemoteVideo = document.getElementById('remote-video')
+
+    const cameraStream = await navigator.mediaDevices.getUserMedia({
+        video: true, 
+        audio: true
+    });
+    receiverLocalVideo.srcObject = cameraStream
+    
+    const rtcOptions = { 
+        sdpSemantics: 'unified-plan',
+        advanced: [{enableDtlsSrtp: {exact: true}}]
+    }
+
+    const peer = new RTCPeerConnection(rtcOptions)
+    peer.addEventListener('icecandidate', e => onLocalIceCandidate(peer, e))
+    peer.addEventListener('track', e => onTrackFound(peer, receiverRemoteVideo, e))
+    
+    addVideoTracks(receiverLocalVideo, peer)
+    
+    document.getElementById('btnMakeOffer').addEventListener('click', 
+        async e => makeOffer(peer))
+
+    await createOffer(peer)
+
+    return peer
+}
+
+async function createOffer(peer) {
+    const offerOptions = {
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: true,
+        voiceActivityDetection: false, 
+        iceRestart: false
+    }
+
+    const offer = await peer.createOffer(offerOptions)
+    peer.setLocalDescription(offer)
+
+    const localSDP = document.getElementById('local-sdp')
+    localSDP.value = offer.sdp
+
+    return offer
+}
+
+
+async function makeOffer(peer) {
+    const xhr = new XMLHttpRequest()
+
+    const sdp = peer.localDescription.sdp
+
+    xhr.open('POST', "/make_offer", false)
+    xhr.send(sdp)
+
+    const response = await xhr.responseText
+    peer.setRemoteDescription({
+        type: "answer",
+        sdp: response
+    })
+
+    const remoteSDP = document.getElementById('remote-sdp')
+    remoteSDP.value = response
+}
+
+async function postIceCandidate(peer, mline, candidate) {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/add_ice_candidate/${mline}`)
+    xhr.send(candidate)
+}
+
+document.addEventListener('DOMContentLoaded', async() => setupPeer());
+
+    </script>
+</head>
+
+<body>
+    <table style="width:100%">
+        <tr>
+            <td>
+                <div>
+                    <table style="width:100%">
+                        <tr>
+                            <td>
+                                <span>Local Video</span>
+                                <input id="btnMakeOffer" type="button" value="Make Offer"/>
+                                <br />
+                                <video id="local-video" autoplay playsinline></video>
+                            </td>
+                            <td>
+                                <span>Remote Video</span>
+                                <br />
+                                <video id="remote-video" autoplay playsinline></video>
+                            </treceiver-
+                        </tr>
+                    </table>                    
+                </div>
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div>
+                    <span>Local SDP - Offer</span>
+                    <br />
+                    <textarea id="local-sdp" rows="20" cols="80"></textarea>
+                </div>
+            </td>
+        </tr>
+        <tr>
+            <td>
+                
+                <div>
+                    <span>Remote SDP - Answer</span>
+                    <br />
+                    <textarea id="remote-sdp" rows="20" cols="80"></textarea>
+                </div>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>

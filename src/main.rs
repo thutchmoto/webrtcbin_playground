@@ -5,6 +5,8 @@ extern crate log;
 
 mod api;
 mod domain;
+mod send_receive;
+mod client_offer;
 mod gstlib;
 mod moz_ice;
 
@@ -29,6 +31,7 @@ async fn main() -> std::io::Result<()> {
                 "/add_ice_candidate/{mline}",
                 web::post().to(api::add_ice_candidate),
             )
+            .route("/make_offer", web::post().to(api::make_offer))
     })
     .bind("127.0.0.1:8080")?
     .run()

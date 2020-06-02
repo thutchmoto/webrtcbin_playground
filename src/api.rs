@@ -10,6 +10,8 @@ use actix_web::web;
 use actix_web::{HttpRequest, Result};
 
 use super::domain::*;
+use super::send_receive;
+use super::client_offer;
 
 pub struct AppState {
     peer: Mutex<Option<Peer>>,
@@ -32,7 +34,7 @@ pub async fn request_offer(state: web::Data<AppState>) -> Result<String> {
     info!("Receiver requested sdp offer");
 
     let (pipeline, webrtcbin, rx) =
-        create_send_receive_pipeline().expect("Could not create pipeline");
+        send_receive::create_send_receive_pipeline().expect("Could not create pipeline");
 
     let offer = get_offer(&webrtcbin, rx).expect("Expected to generate offer");
 
@@ -48,7 +50,7 @@ pub async fn request_offer(state: web::Data<AppState>) -> Result<String> {
 }
 
 pub async fn provide_answer(body: String, state: web::Data<AppState>) -> Result<String> {
-    info!("Received answer for video receiver: \r\n{}", body);
+    info!("Received answer for receiver: \r\n{}", body);
 
     if let Some(s) = state.peer.lock().unwrap().as_ref() {
         process_sdp_answer(&s.webrtcbin, body);
@@ -76,4 +78,23 @@ pub async fn add_ice_candidate(
     }
 
     Ok("ok".to_string())
+}
+
+pub async fn make_offer(body: String, state: web::Data<AppState>) -> Result<String> {
+    info!("Received offer from client: \r\n{}", body);
+
+    let (pipeline, webrtcbin) =
+        client_offer::create_client_offer_pipeline().expect("Could not create pipeline");
+
+    let answer = process_sdp_offer_no_trickle(&webrtcbin, body).expect("Could not process sdp offer.");
+
+    let p = Peer {
+        pipeline,
+        webrtcbin,
+    };
+
+    let mut peer = state.peer.lock().unwrap();
+    *peer = Some(p);
+
+    Ok(answer)
 }

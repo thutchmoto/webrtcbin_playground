@@ -51,101 +51,13 @@ impl IceCandidate {
     }
 }
 
-fn create_pipeline(source: &str) -> Result<gst::Pipeline> {
+pub fn create_pipeline(source: &str) -> Result<gst::Pipeline> {
     let pipeline = gst::parse_launch(source)?.to_pipeline();
 
     Ok(pipeline)
 }
 
-pub fn create_send_receive_pipeline(
-) -> StdResult<(gst::Pipeline, gst::Element, Receiver<IceCandidate>), String> {
-    let pipe_source =
-        "videotestsrc pattern=ball is-live=true ! vp8enc deadline=1 ! rtpvp8pay pt=96 ! webrtcbin. \
-        audiotestsrc is-live=true ! opusenc ! rtpopuspay pt=97 ! webrtcbin. \
-        webrtcbin name=webrtcbin";
-
-    let pipeline = match create_pipeline(pipe_source) {
-        Ok(r) => Ok(r),
-        Error => Err("Could not create pipeline"),
-    }?;
-
-    let webrtcbin = pipeline
-        .get_by_name("webrtcbin")
-        .expect("Could not find webrtcbin element");
-
-    webrtcbin.set_property_from_str("bundle-policy", "max-bundle");
-
-    pipeline.call_async(|p| {
-        p.set_state(gst::State::Playing)
-            .expect("Couldn't set pipeline to Playing");
-        info!("Started webrtc pipeline.");
-    });
-
-    // setup the ice candidate channels
-    let (ice_tx, ice_rx): (Sender<IceCandidate>, Receiver<IceCandidate>) = mpsc::channel();
-
-    // bind and listen for candidates; gathered candidates will be sent on this channel
-    listen_for_local_candidates(&webrtcbin, ice_tx);
-
-    webrtcbin
-        .connect("on-negotiation-needed", false, move |values| {
-            let _webrtc = values[0]
-                .get::<gst::Element>()
-                .expect("Invalid argument")
-                .expect("Should never be null.");
-
-            let local_description = _webrtc
-                .get_property("local-description")
-                .expect("Expected local description.")
-                .get::<gst_webrtc::WebRTCSessionDescription>()
-                .expect("Invalid argument");
-
-            let remote_description = _webrtc
-                .get_property("remote-description")
-                .expect("Expected remote description.")
-                .get::<gst_webrtc::WebRTCSessionDescription>()
-                .expect("Invalid argument");
-
-            info!(
-                "Negotiation needed. Has local {}, has remote {}",
-                local_description.is_some(),
-                remote_description.is_some()
-            );
-
-            auto_create_offer(&_webrtc)
-                .expect("Could not automatically create offer.");
-            None
-        })
-        .unwrap();
-
-    let pad_added_pipeline = pipeline.clone();
-    webrtcbin.connect_pad_added(move |_webrtc, pad| {
-        on_incoming_stream(&pad_added_pipeline, pad)
-            .expect("Could not decode incoming stream.");
-        info!("Connected to new pad");
-    });
-
-    webrtcbin
-        .connect("on-new-transceiver", false, move |values| {
-            let _webrtc = values[0]
-                .get::<gst::Element>()
-                .expect("Invalid argument")
-                .expect("Should never be null.");
-            let transceiver = values[1]
-                .get::<gst_webrtc::WebRTCRTPTransceiver>()
-                .expect("Invalid argument")
-                .unwrap();
-            let mlineindex = transceiver.get_property_mlineindex();
-            info!("New transceiver added; mlineindex = {}", mlineindex);
-
-            None
-        })
-        .unwrap();
-
-    return Ok((pipeline, webrtcbin, ice_rx));
-}
-
-fn auto_create_offer(webrtcbin: &gst::Element) -> Result<()> {
+pub fn auto_create_offer(webrtcbin: &gst::Element) -> Result<()> {
     let webrtcclone = webrtcbin.clone();
     let promise = gst::Promise::new_with_change_func(move |reply| {
         if let Ok(r) = reply {        
@@ -188,6 +100,97 @@ pub fn get_offer(webrtcbin: &gst::Element, ice_receiver: Receiver<IceCandidate>)
     Ok(adjusted_offer)
 }
 
+/// Processes an sdp offer, and provides an sdp answer
+/// with pre-gathered ice candidates
+pub fn process_sdp_offer_no_trickle(webrtcbin: &gst::Element, raw_sdp: String) -> Result<String> {
+    
+    // Gstreamer can actually panic and crash the process if we give it invalid sdp, or
+    // sdp invalid for webrtc; for example, sdp that is valid for sip and audio will
+    // cause a gstreamer panic. So here we are doing a simple sanity check with the moz
+    // library. If it parses there, we'll assume gstreamer will handle it
+    info!("Processing sdp offer: {}", raw_sdp);
+    let parsed_sdp = validate_sdp(&raw_sdp)?;
+    
+    // setup the ice candidate channels
+    let (ice_tx, ice_rx): (Sender<IceCandidate>, Receiver<IceCandidate>) =
+        mpsc::channel();
+
+    // bind and listen for candidates; gathered candidates will be sent on this channel
+    listen_for_local_candidates(webrtcbin, ice_tx);
+
+    let parsed_sdp = gst_sdp::SDPMessage::parse_buffer(raw_sdp.as_bytes())
+        .map_err(|_| anyhow!("Failed to parse SDP offer"))?;
+
+    let offer =
+        gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, parsed_sdp);
+
+    info!("Setting remote description from SDP Offer");
+    webrtcbin
+        .emit("set-remote-description", &[&offer, &None::<gst::Promise>])
+        .unwrap();
+
+    extract_candidates(&raw_sdp).iter().for_each(|c| {
+        add_remote_candidate(webrtcbin, 0, c);
+    });
+
+    let webrtcclone = webrtcbin.clone();
+
+    // the channel lets us send the answer from inside the promise to this current thread
+    let (answer_tx, answer_rx): (Sender<Result<String>>, Receiver<Result<String>>) =
+        mpsc::channel();
+
+    // this promise is our event handler for when webrtcbin generates an answering sdp
+    // We will just take the raw sdp and send it on the channel to communicate with ourselves
+    // outside of the promise
+    let promise = gst::Promise::new_with_change_func(move |reply| {
+        match reply {
+            Ok(reply) => {
+                let answer = reply
+                    .get_value("answer")
+                    .unwrap()
+                    .get::<gst_webrtc::WebRTCSessionDescription>()
+                    .expect("Invalid argument")
+                    .unwrap();
+
+                let raw_answer = answer.get_sdp().as_text().unwrap();
+                info!("Webrtcbin emitted answer {}", raw_answer);
+
+                info!("Setting local description from SDP Answer");
+                webrtcclone
+                    .emit("set-local-description", &[&answer, &None::<gst::Promise>])
+                    .unwrap();
+
+                answer_tx.send(Ok(raw_answer));
+            }
+            Err(_) => {
+                answer_tx.send(Err(anyhow!("No answer provided")));
+            }
+        };
+    });
+
+    webrtcbin
+        .emit("create-answer", &[&None::<gst::Structure>, &promise])
+        .unwrap();
+
+    // read the answer
+    let answer_result = answer_rx
+        .recv()
+        .expect("Could not read answer sdp from webrtcbin")
+        .expect("No answer result");
+
+    let local_candidates = block_gather_local_candidates(ice_rx, 16, Duration::from_millis(100));
+    let adjusted_answer =
+        insert_local_candidates_into_sdp(&answer_result, &local_candidates)?
+        .to_string()
+        .replace("\r\n\r\n", "\r\n");
+
+    info!("Answer with ice candidates: {}", adjusted_answer);
+    
+    // since we have an offer *and* an answer, try to find the 
+    //gst::debug_bin_to_dot_file(&pipeline, gst::DebugGraphDetails::all(), "webrtc_pipeline");
+    Ok(adjusted_answer)
+}
+
 pub fn process_sdp_answer(webrtcbin: &gst::Element, raw_sdp: String) -> Result<()> {
     info!("Processing sdp answer: {}", raw_sdp);
     validate_sdp(&raw_sdp)?;
@@ -228,7 +231,7 @@ fn validate_sdp(sdp: &String) -> Result<webrtc_sdp::SdpSession> {
 }
 
 /// Listens for the gathering of local ice candidates
-fn listen_for_local_candidates(webrtcbin: &gst::Element, sender: Sender<IceCandidate>) {
+pub fn listen_for_local_candidates(webrtcbin: &gst::Element, sender: Sender<IceCandidate>) {
     let shared_sender = Mutex::new(sender);
 
     // wire up a candidate receiver
@@ -354,7 +357,7 @@ fn extract_candidates(sdp: &String) -> Vec<String> {
 }
 
 /// Called by the pad-added event on webrtcbin; only *after* successful ice negotiation
-fn on_incoming_stream(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()>{
+pub fn on_incoming_stream(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()>{
     if pad.get_direction() != gst::PadDirection::Src {
         return Ok(());
     }
