@@ -19,7 +19,6 @@ $ cargo run
 
 And then open your browser and navigate to: http://localhost:8080/send_receive.html
 
-
 ## No-trickle ICE
 The backend does not advertise ice candidates to the front end using trickle ice. Instead, ice candidates are gathered and then manually inserted into the SDP presented to the browser. The reason for this decision is that an internal use case does not allow for an out-of-band channel (websocket or otherwise) over which candidates can be advertiesed to the remote party. In fact, that was the catalyst for this playground; i.e., to adapt the original centricular sendrecv example to not use trickle. 
 
@@ -39,3 +38,10 @@ The offer, with ice candidates, is returned to the browser. The client page crea
 After SDP has been exchanged and ice negotiation is complete, the client page should show the video of the bouncing ball and the white noise. 
 
 To keep things simply, this is a directional flow (i.e., a=sendrecv), and both audio and video are offered.
+
+## Scenario: SENDRECV No Trickle
+This scenario is identical to the SENDRECV scenario, except the exchange of ice candidates from the browser to the media server does not occur over a trickle channel. Instead, the ice candidates are included in the sdp answer submitted to the server. 
+
+On the backend, the media server must extract the ice candidates from the payload and manually add them to webrtcbin via the `add-ice-candidate` signal. I.e., webrtcbin does not support non-trickle workflows; it will not automatically inspect the submitted sdp for ice candidates. And without emiting that signal, the ice state machine will never progress, which prevents the pad-added signal from ever firing, which prevents media from ever actually flowing. 
+
+This scenario is exercised from the page: http://localhost:8080/send_receive_no_trickle.html
