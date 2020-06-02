@@ -31,6 +31,9 @@ pub struct IceCandidate {
     pub candidate_str: String,
 }
 
+const PREFIX_ATTRIBUTE: &str = "a=";
+const PREFIX_ATTRIBUTE_CANDIDATE: &str = "a=candidate";
+
 impl IceCandidate {
     pub fn new(media_line_index: u32, candidate_str: String) -> Self {
         IceCandidate {
@@ -78,10 +81,6 @@ pub fn create_send_receive_pipeline(
         info!("Started webrtc pipeline.");
     });
 
-    // Create a stream for handling the GStreamer message asynchronously
-    let bus = pipeline.get_bus().unwrap();
-    let send_gst_msg_rx = gst::BusStream::new(&bus);
-
     // setup the ice candidate channels
     let (ice_tx, ice_rx): (Sender<IceCandidate>, Receiver<IceCandidate>) = mpsc::channel();
 
@@ -113,21 +112,18 @@ pub fn create_send_receive_pipeline(
                 remote_description.is_some()
             );
 
-            auto_create_offer(&_webrtc);
+            auto_create_offer(&_webrtc)
+                .expect("Could not automatically create offer.");
             None
         })
         .unwrap();
 
-    // webrtcbin
-    //     .connect("pad-added", false, move |values| {
+    let pad_added_pipeline = pipeline.clone();
     webrtcbin.connect_pad_added(move |_webrtc, pad| {
-        // let _webrtc = values[0]
-        //         .get::<gst::Element>()
-        //         .expect("Invalid argument")
-        //         .expect("Should never be null.");
+        on_incoming_stream(&pad_added_pipeline, pad)
+            .expect("Could not decode incoming stream.");
         info!("Connected to new pad");
     });
-    //.unwrap();
 
     webrtcbin
         .connect("on-new-transceiver", false, move |values| {
@@ -150,39 +146,27 @@ pub fn create_send_receive_pipeline(
 }
 
 fn auto_create_offer(webrtcbin: &gst::Element) -> Result<()> {
-    // setup the ice candidate channels
-    let (ice_tx, ice_rx): (Sender<IceCandidate>, Receiver<IceCandidate>) = mpsc::channel();
-
-    // the channel lets us send the answer from inside the promise to this current thread
-    let (offer_tx, offer_rx): (Sender<Result<String>>, Receiver<Result<String>>) = mpsc::channel();
-
     let webrtcclone = webrtcbin.clone();
     let promise = gst::Promise::new_with_change_func(move |reply| {
-        match reply {
-            Ok(reply) => {
-                let offer = reply
-                    .get_value("offer")
-                    .unwrap()
-                    .get::<gst_webrtc::WebRTCSessionDescription>()
-                    .expect("Invalid argument")
-                    .unwrap();
+        if let Ok(r) = reply {        
+            let offer = r
+                .get_value("offer")
+                .unwrap()
+                .get::<gst_webrtc::WebRTCSessionDescription>()
+                .expect("Invalid argument")
+                .unwrap();
 
-                let raw_offer = offer.get_sdp().as_text().unwrap();
-                info!("Webrtcbin emitted offer {}", raw_offer);
+            let raw_offer = offer.get_sdp().as_text().unwrap();
+            info!("Webrtcbin emitted offer {}", raw_offer);
 
-                info!("Setting local description from SDP Offer");
-                webrtcclone
-                    .emit("set-local-description", &[&offer, &None::<gst::Promise>])
-                    .unwrap();
-
-                offer_tx.send(Ok(raw_offer));
-            }
-            Err(_) => {
-                offer_tx.send(Err(anyhow!("No offer provided")));
-            }
-        };
+            info!("Setting local description from SDP Offer");
+            webrtcclone
+                .emit("set-local-description", &[&offer, &None::<gst::Promise>])
+                .unwrap();
+            
+        }
     });
-
+        
     webrtcbin
         .emit("create-offer", &[&None::<gst::Structure>, &promise])
         .unwrap();
@@ -215,6 +199,12 @@ pub fn process_sdp_answer(webrtcbin: &gst::Element, raw_sdp: String) -> Result<(
     webrtcbin
         .emit("set-remote-description", &[&answer, &None::<gst::Promise>])
         .unwrap();
+
+    let candidates = extract_candidates(&raw_sdp);
+    candidates.iter().for_each(|candidate| {
+        add_remote_candidate(&webrtcbin, 0, candidate)
+            .unwrap();
+    });
 
     Ok(())
 }
@@ -342,4 +332,78 @@ fn insert_local_candidates_into_sdp(
     });
 
     Ok(session)
+}
+
+/// Parses the given sdp for all ice candidates
+/// Returns a vec of simple strings, with the leading a= removed. 
+/// For, example, the following sdp:
+///     a=rtcp:9 IN IP4 0.0.0.0
+///     a=candidate:3719404024 1 udp 2122260223 192.168.0.91 55827 typ host generation 0 network-id 1 network-cost 10
+///     a=ice-ufrag:avZ6
+/// yields vec!["candidate:3719404024 1 udp 2122260223 192.168.0.91 55827 typ host generation 0 network-id 1 network-cost 10"]
+/// Ice candidates need to be added to webrtcbin with a media line index, but we're forcing max-bundle, which means
+/// all streams are transmitted over the same connection, which ultimately will be the first media; media line index will be always
+/// be zero in max-bundle
+fn extract_candidates(sdp: &String) -> Vec<String> {
+    let lines = sdp.lines().collect::<Vec<_>>();
+    lines
+        .iter()
+        .filter(|l| l.starts_with(PREFIX_ATTRIBUTE_CANDIDATE))
+        .map(|l| l.trim_start_matches(PREFIX_ATTRIBUTE).to_string())
+        .collect::<Vec<_>>()
+}
+
+/// Called by the pad-added event on webrtcbin; only *after* successful ice negotiation
+fn on_incoming_stream(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()>{
+    if pad.get_direction() != gst::PadDirection::Src {
+        return Ok(());
+    }
+
+    let decodebin = gst::ElementFactory::make("decodebin", None).unwrap();
+    let pipeclone = pipeline.clone();
+    decodebin.connect_pad_added(move |_decodebin, pad| {
+        add_stream_destination(&pipeclone, pad).expect("Could not add stream destination.");
+    });
+
+    pipeline.add(&decodebin).unwrap();
+    decodebin.sync_state_with_parent().unwrap();
+
+    let sinkpad = decodebin.get_static_pad("sink").unwrap();
+    pad.link(&sinkpad).unwrap();
+
+    Ok(())
+}
+
+/// creates a destination where audio or video will be dumped, depending on the
+/// pad's capabilities.
+/// 
+/// The gstwebrtc-demos dumps the media to autovideosink or autoaudiosink, which
+/// demonstrates that media is actually flowing bidirectionally. 
+/// Here's we're just going to dump to fake sinks instead
+fn add_stream_destination(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()> {
+    let caps = pad.get_current_caps().unwrap();
+    let name = caps.get_structure(0).unwrap().get_name();
+
+    let sink = if name.starts_with("video/") {
+        gst::parse_bin_from_description(
+            "queue ! videoconvert ! videoscale ! fakesink",
+            true,
+        )?
+    } else if name.starts_with("audio/") {
+        gst::parse_bin_from_description(
+            "queue ! audioconvert ! audioresample ! fakesink",
+            true,
+        )?
+    } else {
+        println!("Unknown pad {:?}, ignoring", pad);
+        return Ok(());
+    };
+
+    pipeline.add(&sink).unwrap();
+    sink.sync_state_with_parent()?;
+
+    let sinkpad = sink.get_static_pad("sink").unwrap();
+    pad.link(&sinkpad)?;
+
+    Ok(())
 }
