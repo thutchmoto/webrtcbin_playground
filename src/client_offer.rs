@@ -13,8 +13,8 @@ type StdResult<L, R> = std::result::Result<L, R>;
 pub fn create_client_offer_pipeline(
 ) -> StdResult<(gst::Pipeline, gst::Element), String> {
     let pipe_source =
-        "videotestsrc pattern=ball is-live=true ! vp8enc deadline=1 ! rtpvp8pay pt=96 ! webrtcbin. \
-        audiotestsrc is-live=true ! opusenc ! rtpopuspay pt=97 ! webrtcbin. \
+        "videotestsrc pattern=ball is-live=true ! vp8enc deadline=1 ! rtpvp8pay ! webrtcbin. \
+        audiotestsrc is-live=true ! opusenc ! rtpopuspay pt=111 ! webrtcbin. \
         webrtcbin name=webrtcbin";
 
     let pipeline = match create_pipeline(pipe_source) {

@@ -68,8 +68,6 @@ async function createOffer(peer) {
     const offerOptions = {
         offerToReceiveVideo: true,
         offerToReceiveAudio: true,
-        voiceActivityDetection: false, 
-        iceRestart: false
     }
 
     const offer = await peer.createOffer(offerOptions)

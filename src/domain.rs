@@ -17,8 +17,6 @@ use anyhow::{anyhow, Result};
 use super::gstlib::*;
 use super::moz_ice;
 
-type StdResult<L, R> = std::result::Result<L, R>;
-
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub pipeline: gst::Pipeline,
@@ -33,6 +31,7 @@ pub struct IceCandidate {
 
 const PREFIX_ATTRIBUTE: &str = "a=";
 const PREFIX_ATTRIBUTE_CANDIDATE: &str = "a=candidate";
+const PREFIX_MEDIA_LINE: &str = "m=";
 
 impl IceCandidate {
     pub fn new(media_line_index: u32, candidate_str: String) -> Self {
@@ -130,7 +129,7 @@ pub fn process_sdp_offer_no_trickle(webrtcbin: &gst::Element, raw_sdp: String) -
         .unwrap();
 
     extract_candidates(&raw_sdp).iter().for_each(|c| {
-        add_remote_candidate(webrtcbin, 0, c);
+        add_remote_candidate(webrtcbin, c.media_line_index, &c.candidate_str);
     });
 
     let webrtcclone = webrtcbin.clone();
@@ -178,7 +177,7 @@ pub fn process_sdp_offer_no_trickle(webrtcbin: &gst::Element, raw_sdp: String) -
         .expect("Could not read answer sdp from webrtcbin")
         .expect("No answer result");
 
-    let local_candidates = block_gather_local_candidates(ice_rx, 16, Duration::from_millis(100));
+    let local_candidates = block_gather_local_candidates(ice_rx, 64, Duration::from_millis(100));
     let adjusted_answer =
         insert_local_candidates_into_sdp(&answer_result, &local_candidates)?
         .to_string()
@@ -205,7 +204,7 @@ pub fn process_sdp_answer(webrtcbin: &gst::Element, raw_sdp: String) -> Result<(
 
     let candidates = extract_candidates(&raw_sdp);
     candidates.iter().for_each(|candidate| {
-        add_remote_candidate(&webrtcbin, 0, candidate)
+        add_remote_candidate(&webrtcbin, candidate.media_line_index, &candidate.candidate_str)
             .unwrap();
     });
 
@@ -337,23 +336,23 @@ fn insert_local_candidates_into_sdp(
     Ok(session)
 }
 
-/// Parses the given sdp for all ice candidates
-/// Returns a vec of simple strings, with the leading a= removed. 
-/// For, example, the following sdp:
-///     a=rtcp:9 IN IP4 0.0.0.0
-///     a=candidate:3719404024 1 udp 2122260223 192.168.0.91 55827 typ host generation 0 network-id 1 network-cost 10
-///     a=ice-ufrag:avZ6
-/// yields vec!["candidate:3719404024 1 udp 2122260223 192.168.0.91 55827 typ host generation 0 network-id 1 network-cost 10"]
-/// Ice candidates need to be added to webrtcbin with a media line index, but we're forcing max-bundle, which means
-/// all streams are transmitted over the same connection, which ultimately will be the first media; media line index will be always
-/// be zero in max-bundle
-fn extract_candidates(sdp: &String) -> Vec<String> {
-    let lines = sdp.lines().collect::<Vec<_>>();
-    lines
-        .iter()
-        .filter(|l| l.starts_with(PREFIX_ATTRIBUTE_CANDIDATE))
-        .map(|l| l.trim_start_matches(PREFIX_ATTRIBUTE).to_string())
-        .collect::<Vec<_>>()
+fn extract_candidates(sdp: &String) -> Vec<IceCandidate> {
+    let mut media_line_index: i32 = -1;
+    let mut candidates = vec![];
+
+    for (index, line) in sdp.lines().collect::<Vec<_>>().iter().enumerate() {
+        if line.starts_with(PREFIX_ATTRIBUTE_CANDIDATE) {
+            let candidate_str = line.trim_start_matches(PREFIX_ATTRIBUTE).to_string();
+            candidates.push(IceCandidate{
+                media_line_index: media_line_index as u32,
+                candidate_str
+            });
+        } else if line.starts_with(PREFIX_MEDIA_LINE) {
+            media_line_index = media_line_index + 1;
+        }
+    };
+    
+    candidates
 }
 
 /// Called by the pad-added event on webrtcbin; only *after* successful ice negotiation
@@ -398,7 +397,7 @@ fn add_stream_destination(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()
             true,
         )?
     } else {
-        println!("Unknown pad {:?}, ignoring", pad);
+        warn!("Unknown pad {:?}, ignoring", pad);
         return Ok(());
     };
 
